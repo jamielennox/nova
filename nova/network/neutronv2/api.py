@@ -18,6 +18,10 @@
 import time
 import uuid
 
+from keystoneclient import auth
+from keystoneclient.auth.identity import v2 as v2_auth
+from keystoneclient.auth import token_endpoint
+from keystoneclient import session
 from neutronclient.common import exceptions as neutron_client_exc
 from neutronclient.v2_0 import client as clientv20
 from oslo.config import cfg
@@ -43,36 +47,8 @@ neutron_opts = [
     cfg.StrOpt('url',
                default='http://127.0.0.1:9696',
                help='URL for connecting to neutron'),
-    cfg.IntOpt('url_timeout',
-               default=30,
-               help='Timeout value for connecting to neutron in seconds'),
-    cfg.StrOpt('admin_user_id',
-               help='User id for connecting to neutron in admin context'),
-    cfg.StrOpt('admin_username',
-               help='Username for connecting to neutron in admin context'),
-    cfg.StrOpt('admin_password',
-               help='Password for connecting to neutron in admin context',
-               secret=True),
-    cfg.StrOpt('admin_tenant_id',
-               help='Tenant id for connecting to neutron in admin context'),
-    cfg.StrOpt('admin_tenant_name',
-               help='Tenant name for connecting to neutron in admin context. '
-                    'This option will be ignored if neutron_admin_tenant_id '
-                    'is set. Note that with Keystone V3 tenant names are '
-                    'only unique within a domain.'),
     cfg.StrOpt('region_name',
                help='Region name for connecting to neutron in admin context'),
-    cfg.StrOpt('admin_auth_url',
-               default='http://localhost:5000/v2.0',
-               help='Authorization URL for connecting to neutron in admin '
-               'context'),
-    cfg.BoolOpt('api_insecure',
-                default=False,
-                help='If set, ignore any SSL validation issues'),
-    cfg.StrOpt('auth_strategy',
-               default='keystone',
-               help='Authorization strategy for connecting to '
-                    'neutron in admin context'),
     # TODO(berrange) temporary hack until Neutron can pass over the
     # name of the OVS bridge it is configured with
     cfg.StrOpt('ovs_bridge',
@@ -82,17 +58,129 @@ neutron_opts = [
                 default=600,
                 help='Number of seconds before querying neutron for'
                      ' extensions'),
-    cfg.StrOpt('ca_certificates_file',
-                help='Location of CA certificates file to use for '
-                     'neutron client requests.'),
     cfg.BoolOpt('allow_duplicate_networks',
                 default=False,
                 help='Allow an instance to have multiple vNICs attached to '
                     'the same Neutron network.'),
    ]
 
+NEUTRON_GROUP = 'neutron'
+
 CONF = cfg.CONF
-CONF.register_opts(neutron_opts, 'neutron')
+CONF.register_opts(neutron_opts, NEUTRON_GROUP)
+
+deprecations = {'cafile': [cfg.DeprecatedOpt('ca_certificates_file',
+                                             group=NEUTRON_GROUP)],
+                'insecure': [cfg.DeprecatedOpt('api_insecure',
+                                               group=NEUTRON_GROUP)],
+                'timeout': [cfg.DeprecatedOpt('url_timeout',
+                                              group=NEUTRON_GROUP)]}
+
+session.Session.register_conf_options(CONF, NEUTRON_GROUP,
+                                      deprecated_opts=deprecations)
+
+
+class PluginProxy(auth.BaseAuthPlugin):
+
+    def __init__(self, plugin, url=None):
+        super(PluginProxy, self).__init__()
+        self._plugin = plugin
+        self._url = url
+
+    def get_endpoint(self, *args, **kwargs):
+        # FIXME(jamielennox): Neutron should just use the service catalog URL.
+        # The url override part of the proxy here can go away when
+        # neutronclient finally gets updated to just use the keystoneclient
+        # adapter in favour of adding endpoint_override to the client.
+        if self._url:
+            return self._url
+
+        return self._plugin.get_endpoint(*args, **kwargs)
+
+    def get_token(self, *args, **kwargs):
+        return self._plugin.get_token(*args, **kwargs)
+
+    def invalidate(self, *args, **kwargs):
+        return self._plugin.invalidate(*args, **kwargs)
+
+
+class DefaultAuthPlugin(PluginProxy):
+
+    @classmethod
+    def get_options(cls):
+        opts = super(DefaultAuthPlugin, cls).get_options()
+
+        admin_ctx = '%s for connecting to neutron in admin context'
+
+        opts.extend([
+            cfg.StrOpt('admin_auth_url',
+                       default='http://localhost:5000/v2.0',
+                       help=admin_ctx % 'Authorization URL'),
+            cfg.StrOpt('admin_user_id',
+                       help=admin_ctx % 'User id'),
+            cfg.StrOpt('admin_username',
+                       help=admin_ctx % 'Username'),
+            cfg.StrOpt('admin_password',
+                       help=admin_ctx % 'Password',
+                       secret=True),
+            cfg.StrOpt('admin_tenant_id',
+                       help=admin_ctx % 'Tenant id'),
+            cfg.StrOpt('admin_tenant_name',
+                       help=admin_ctx % 'Tenant name' +
+                            'This option will be ignored if '
+                            'neutron_admin_tenant_id is set. Note that with '
+                            'Keystone V3 tenant names are only unique within '
+                            'a domain.'),
+            cfg.StrOpt('auth_strategy',
+                       default='keystone',
+                       help=admin_ctx % 'Authorization strategy')
+        ])
+
+        return opts
+
+    @classmethod
+    def load_from_options(cls, admin_auth_url, admin_user_id, admin_username,
+                          admin_password, admin_tenant_id, admin_tenant_name,
+                          auth_strategy, url):
+        plugin = None
+
+        if auth_strategy == 'noauth':
+            if not url:
+                message = _('For "noauth" authentication strategy, the '
+                            'endpoint must be specified CONF.neutron.url')
+                raise neutron_client_exc.Unauthorized(message=message)
+
+            plugin = token_endpoint.Token(endpoint, 'noauth')
+
+        elif auth_strategy in ('keystone', None):
+            plugin = v2_auth.Password(auth_url=admin_auth_url,
+                                      user_id=admin_user_id,
+                                      username=admin_username,
+                                      password=admin_password,
+                                      tenant_id=admin_tenant_id,
+                                      tenant_name=admin_tenant_name)
+        else:
+            err_msg = 'Unknown auth strategy: %s' % auth_strategy
+            raise neutron_client_exc.Unauthorized(message=err_msg)
+
+        return super(DefaultAuthPlugin, cls).load_from_options(plugin=plugin,
+                                                               url=url)
+
+    @classmethod
+    def load_from_conf_options(cls, conf, group, **kwargs):
+        kwargs['url'] = conf[group]['url']
+        return super(DefaultAuthPlugin, cls).load_from_conf_options(conf,
+                                                                    group,
+                                                                    **kwargs)
+
+
+auth.register_conf_options(CONF, NEUTRON_GROUP)
+
+# NOTE(jamielennox): registering the plugin options again should only be
+# required until keystoneclient allows adding a default to
+# register_conf_options
+CONF.register_opts(DefaultAuthPlugin.get_options(), NEUTRON_GROUP)
+
 CONF.import_opt('default_floating_pool', 'nova.network.floating_ips')
 CONF.import_opt('flat_injected', 'nova.network.manager')
 LOG = logging.getLogger(__name__)
@@ -100,97 +188,66 @@ LOG = logging.getLogger(__name__)
 soft_external_network_attach_authorize = extensions.soft_core_authorizer(
     'network', 'attach_external_network')
 
+_SESSION = None
+_ADMIN_AUTH = None
 
-class AdminTokenStore(object):
+def reset_state():
+    global _ADMIN_AUTH
+    global _SESSION
 
-    _instance = None
-
-    def __init__(self):
-        self.admin_auth_token = None
-
-    @classmethod
-    def get(cls):
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
-
-def _get_client(token=None, admin=False):
-    params = {
-        'endpoint_url': CONF.neutron.url,
-        'timeout': CONF.neutron.url_timeout,
-        'insecure': CONF.neutron.api_insecure,
-        'ca_cert': CONF.neutron.ca_certificates_file,
-        'auth_strategy': CONF.neutron.auth_strategy,
-        'token': token,
-    }
-
-    if admin:
-        if CONF.neutron.admin_user_id:
-            params['user_id'] = CONF.neutron.admin_user_id
-        else:
-            params['username'] = CONF.neutron.admin_username
-        if CONF.neutron.admin_tenant_id:
-            params['tenant_id'] = CONF.neutron.admin_tenant_id
-        else:
-            params['tenant_name'] = CONF.neutron.admin_tenant_name
-        params['password'] = CONF.neutron.admin_password
-        params['auth_url'] = CONF.neutron.admin_auth_url
-    return clientv20.Client(**params)
-
-
-class ClientWrapper(clientv20.Client):
-    '''A neutron client wrapper class.
-       Wraps the callable methods, executes it and updates the token,
-       as it might change when expires.
-    '''
-
-    def __init__(self, base_client):
-        # Expose all attributes from the base_client instance
-        self.__dict__ = base_client.__dict__
-        self.base_client = base_client
-
-    def __getattribute__(self, name):
-        obj = object.__getattribute__(self, name)
-        if callable(obj):
-            obj = object.__getattribute__(self, 'proxy')(obj)
-        return obj
-
-    def proxy(self, obj):
-        def wrapper(*args, **kwargs):
-            ret = obj(*args, **kwargs)
-            new_token = self.base_client.get_auth_info()['auth_token']
-            _update_token(new_token)
-            return ret
-        return wrapper
-
-
-def _update_token(new_token):
-    with lockutils.lock('neutron_admin_auth_token_lock'):
-        token_store = AdminTokenStore.get()
-        token_store.admin_auth_token = new_token
+    _ADMIN_AUTH = None
+    _SESSION = None
 
 
 def get_client(context, admin=False):
-    # NOTE(dprince): In the case where no auth_token is present
-    # we allow use of neutron admin tenant credentials if
-    # it is an admin context.
-    # This is to support some services (metadata API) where
-    # an admin context is used without an auth token.
+    # NOTE(dprince): In the case where no auth_token is present we allow use of
+    # neutron admin tenant credentials if it is an admin context.  This is to
+    # support some services (metadata API) where an admin context is used
+    # without an auth token.
+    global _ADMIN_AUTH
+    global _SESSION
+
+    auth_plugin = None
+    endpoint = CONF.neutron.url
+
+    if not _SESSION:
+        _SESSION = session.Session.load_from_conf_options(CONF, NEUTRON_GROUP)
+
     if admin or (context.is_admin and not context.auth_token):
+        # NOTE(jamielennox): The theory here is that we maintain one
+        # authenticated admin auth globally. The plugin will authenticate
+        # internally (not thread safe) and on demand so we extract a current
+        # auth plugin from it (whilst locked). This may or may not require
+        # reauthentication. We then use the static token plugin to issue the
+        # actual request with that current token in a thread safe way.
+        if not _ADMIN_AUTH:
+            _ADMIN_AUTH = auth.load_from_conf_options(CONF, NEUTRON_GROUP)
+
+            if not _ADMIN_AUTH:
+                _ADMIN_AUTH = DefaultAuthPlugin.load_from_conf_options(
+                    CONF, NEUTRON_GROUP)
+
         with lockutils.lock('neutron_admin_auth_token_lock'):
-            orig_token = AdminTokenStore.get().admin_auth_token
-        client = _get_client(orig_token, admin=True)
-        return ClientWrapper(client)
+            # FIXME(jamielennox): We should also retrieve the endpoint from the
+            # catalog here rather than relying on setting it in CONF.
+            auth_token = _ADMIN_AUTH.get_token(_SESSION)
 
-    # We got a user token that we can use that as-is
-    if context.auth_token:
-        token = context.auth_token
-        return _get_client(token=token)
+        auth_plugin = token_endpoint.Token(endpoint, auth_token)
 
-    # We did not get a user token and we should not be using
-    # an admin token so log an error
-    raise neutron_client_exc.Unauthorized()
+    elif context.auth_token:
+        # NOTE(jamielennox): The url override part here can go away when
+        # neutronclient finally gets updated to just use the keystoneclient
+        # adapter in favour of adding endpoint_override to the client creation.
+        auth_plugin = PluginProxy(context.get_auth_plugin(), endpoint)
+
+    if not auth_plugin:
+        # We did not get a user token and we should not be using
+        # an admin token so log an error
+        raise neutron_client_exc.Unauthorized()
+
+    return clientv20.Client(session=_SESSION,
+                            auth=auth_plugin,
+                            region_name=CONF.neutron.region_name)
 
 
 class API(base_api.NetworkAPI):
