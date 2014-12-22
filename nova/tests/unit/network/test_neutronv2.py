@@ -113,7 +113,7 @@ class TestNeutronClient(test.TestCase):
 
         self.assertEqual(CONF.neutron.url, cl.httpclient.auth._url)
         self.assertEqual(my_context.auth_token,
-                         cl.httpclient.auth._plugin.auth_token)
+                         cl.httpclient.auth.auth_token)
         self.assertEqual(CONF.neutron.timeout, cl.httpclient.session.timeout)
 
     def test_withouttoken(self):
@@ -133,7 +133,7 @@ class TestNeutronClient(test.TestCase):
 
         self.assertEqual(CONF.neutron.url, cl.httpclient.auth._url)
         self.assertEqual(my_context.auth_token,
-                         cl.httpclient.auth._plugin.auth_token)
+                         cl.httpclient.auth.auth_token)
         self.assertEqual(CONF.neutron.timeout, cl.httpclient.session.timeout)
 
     def test_withouttoken_keystone_connection_error(self):
@@ -3128,7 +3128,7 @@ class TestNeutronClientForAdminScenarios(test.TestCase):
             # the context has an auth_token.
             context_client = neutronapi.get_client(my_context, True)
 
-        admin_auth = neutronapi._ADMIN_AUTH._plugin
+        admin_auth = neutronapi._ADMIN_AUTH
 
         self.assertEqual(CONF.neutron.admin_auth_url, admin_auth.auth_url)
         self.assertEqual(CONF.neutron.admin_password, admin_auth.password)
@@ -3149,9 +3149,10 @@ class TestNeutronClientForAdminScenarios(test.TestCase):
             self.assertIsNone(admin_auth.user_id)
 
         self.assertEqual(CONF.neutron.timeout, neutronapi._SESSION.timeout)
-        self.assertEqual(CONF.neutron.url, neutronapi._ADMIN_AUTH._url)
 
         self.assertEqual(token_value, context_client.httpclient.auth.token)
+        self.assertEqual(CONF.neutron.url,
+                         context_client.httpclient.auth.endpoint)
 
     def test_get_client_for_admin(self):
         self._test_get_client_for_admin()

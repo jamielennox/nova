@@ -115,15 +115,11 @@ class PluginProxy(object):
     """
 
     def __init__(self, plugin, url):
-        super(PluginProxy, self).__init__()
         self._plugin = plugin
         self._url = url
 
     def __getattr__(self, name):
         return getattr(self._plugin, name)
-
-    def __setattr__(self, name, val):
-        return setattr(self._plugin, name, val)
 
     def get_endpoint(self, *args, **kwargs):
         # FIXME(jamielennox): Neutron should just use the service catalog URL.
@@ -155,10 +151,10 @@ def reset_state():
 
 
 def _load_auth_plugin(conf):
-   auth_plugin = auth.load_from_conf_options(conf, NEUTRON_GROUP)
+    auth_plugin = auth.load_from_conf_options(conf, NEUTRON_GROUP)
 
-   if auth_plugin:
-       return auth_plugin
+    if auth_plugin:
+        return auth_plugin
 
     if conf.neutron.auth_strategy == 'noauth':
         if not conf.neutron.url:
