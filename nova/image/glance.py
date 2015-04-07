@@ -25,6 +25,7 @@ import time
 
 import glanceclient
 import glanceclient.exc
+from keystoneclient import session
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
@@ -106,47 +107,6 @@ def _parse_image_ref(image_href):
     return (image_id, host, port, use_ssl)
 
 
-def generate_identity_headers(context, status='Confirmed'):
-    return {
-        'X-Auth-Token': getattr(context, 'auth_token', None),
-        'X-User-Id': getattr(context, 'user', None),
-        'X-Tenant-Id': getattr(context, 'tenant', None),
-        'X-Roles': ','.join(context.roles),
-        'X-Identity-Status': status,
-        'X-Service-Catalog': jsonutils.dumps(context.service_catalog),
-    }
-
-
-def _create_glance_client(context, host, port, use_ssl, version=1):
-    """Instantiate a new glanceclient.Client object."""
-    params = {}
-    if use_ssl:
-        scheme = 'https'
-        # https specific params
-        params['insecure'] = CONF.glance.api_insecure
-        params['ssl_compression'] = False
-        if CONF.ssl.cert_file:
-            params['cert_file'] = CONF.ssl.cert_file
-        if CONF.ssl.key_file:
-            params['key_file'] = CONF.ssl.key_file
-        if CONF.ssl.ca_file:
-            params['cacert'] = CONF.ssl.ca_file
-    else:
-        scheme = 'http'
-
-    if CONF.auth_strategy == 'keystone':
-        # NOTE(isethi): Glanceclient <= 0.9.0.49 accepts only
-        # keyword 'token', but later versions accept both the
-        # header 'X-Auth-Token' and 'token'
-        params['token'] = context.auth_token
-        params['identity_headers'] = generate_identity_headers(context)
-    if netutils.is_valid_ipv6(host):
-        # if so, it is ipv6 address, need to wrap it with '[]'
-        host = '[%s]' % host
-    endpoint = '%s://%s:%s' % (scheme, host, port)
-    return glanceclient.Client(str(version), endpoint, **params)
-
-
 def get_api_servers():
     """Shuffle a list of CONF.glance.api_servers and return an iterator
     that will cycle through the list, looping around to the beginning
@@ -171,78 +131,10 @@ def get_api_servers():
     return itertools.cycle(api_servers)
 
 
-class GlanceClientWrapper(object):
-    """Glance client wrapper class that implements retries."""
-
-    def __init__(self, context=None, host=None, port=None, use_ssl=False,
-                 version=1):
-        if host is not None:
-            self.client = self._create_static_client(context,
-                                                     host, port,
-                                                     use_ssl, version)
-        else:
-            self.client = None
-        self.api_servers = None
-
-    def _create_static_client(self, context, host, port, use_ssl, version):
-        """Create a client that we'll use for every call."""
-        self.host = host
-        self.port = port
-        self.use_ssl = use_ssl
-        self.version = version
-        return _create_glance_client(context,
-                                     self.host, self.port,
-                                     self.use_ssl, self.version)
-
-    def _create_onetime_client(self, context, version):
-        """Create a client that will be used for one call."""
-        if self.api_servers is None:
-            self.api_servers = get_api_servers()
-        self.host, self.port, self.use_ssl = self.api_servers.next()
-        return _create_glance_client(context,
-                                     self.host, self.port,
-                                     self.use_ssl, version)
-
-    def call(self, context, version, method, *args, **kwargs):
-        """Call a glance client method.  If we get a connection error,
-        retry the request according to CONF.glance.num_retries.
-        """
-        retry_excs = (glanceclient.exc.ServiceUnavailable,
-                glanceclient.exc.InvalidEndpoint,
-                glanceclient.exc.CommunicationError)
-        num_attempts = 1 + CONF.glance.num_retries
-
-        for attempt in xrange(1, num_attempts + 1):
-            client = self.client or self._create_onetime_client(context,
-                                                                version)
-            try:
-                return getattr(client.images, method)(*args, **kwargs)
-            except retry_excs as e:
-                host = self.host
-                port = self.port
-
-                if attempt < num_attempts:
-                    extra = "retrying"
-                else:
-                    extra = 'done trying'
-
-                error_msg = (_("Error contacting glance server "
-                               "'%(host)s:%(port)s' for '%(method)s', "
-                               "%(extra)s.") %
-                             {'host': host, 'port': port,
-                              'method': method, 'extra': extra})
-                LOG.exception(error_msg)
-                if attempt == num_attempts:
-                    raise exception.GlanceConnectionFailed(
-                            host=host, port=port, reason=six.text_type(e))
-                time.sleep(1)
-
-
 class GlanceImageService(object):
     """Provides storage and retrieval of disk image objects within Glance."""
 
-    def __init__(self, client=None):
-        self._client = client or GlanceClientWrapper()
+    def __init__(self):
         # NOTE(jbresnah) build the table of download handlers at the beginning
         # so that operators can catch errors at load time rather than whenever
         # a user attempts to use a module.  Note this cannot be done in glance
@@ -262,11 +154,22 @@ class GlanceImageService(object):
                               'following error occurred: %(ex)s'),
                           {'module_str': str(mod), 'ex': ex})
 
+    def get_client(self, context, version=1):
+        auth_plugin = context.get_auth_plugin()
+        sess = session.Session.load_from_conf_options(CONF.glance,
+                                                      auth=auth_plugin)
+
+        return glanceclient.Client(session=sess,
+                                   version=version,
+                                   connect_retries=CONF.glance.num_retries)
+
     def detail(self, context, **kwargs):
         """Calls out to Glance for a list of detailed image information."""
         params = _extract_query_params(kwargs)
+        client = self.get_client(context)
+
         try:
-            images = self._client.call(context, 1, 'list', **params)
+            images = client.list(**params)
         except Exception:
             _reraise_translated_exception()
 
@@ -295,8 +198,9 @@ class GlanceImageService(object):
         version = 1
         if include_locations:
             version = 2
+        client = self.get_client(context, version=version)
         try:
-            image = self._client.call(context, version, 'get', image_id)
+            image = client.get(image_id)
         except Exception:
             _reraise_translated_image_exception(image_id)
 
@@ -346,8 +250,9 @@ class GlanceImageService(object):
                     except Exception:
                         LOG.exception(_LE("Download image error"))
 
+        client = self.get_client(context)
         try:
-            image_chunks = self._client.call(context, 1, 'data', image_id)
+            image_chunks = client.data(image_id)
         except Exception:
             _reraise_translated_image_exception(image_id)
 
@@ -373,9 +278,9 @@ class GlanceImageService(object):
         if data:
             sent_service_image_meta['data'] = data
 
+        client = self.get(context)
         try:
-            recv_service_image_meta = self._client.call(
-                context, 1, 'create', **sent_service_image_meta)
+            recv_service_image_meta = client.create(**sent_service_image_meta)
         except glanceclient.exc.HTTPException:
             _reraise_translated_exception()
 
@@ -391,9 +296,9 @@ class GlanceImageService(object):
         image_meta.pop('id', None)
         if data:
             image_meta['data'] = data
+        client = self.get_client(context)
         try:
-            image_meta = self._client.call(context, 1, 'update',
-                                           image_id, **image_meta)
+            image_meta = client.update(image_id, **image_meta)
         except Exception:
             _reraise_translated_image_exception(image_id)
         else:
@@ -407,8 +312,9 @@ class GlanceImageService(object):
         :raises: ImageNotAuthorized if the user is not authorized.
 
         """
+        client = self.get_client(context)
         try:
-            self._client.call(context, 1, 'delete', image_id)
+            client.delete(image_id)
         except glanceclient.exc.NotFound:
             raise exception.ImageNotFound(image_id=image_id)
         except glanceclient.exc.HTTPForbidden:
