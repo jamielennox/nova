@@ -76,6 +76,8 @@ CONF.import_opt('auth_strategy', 'nova.api.auth')
 CONF.import_opt('my_ip', 'nova.netconf')
 CONF.import_group('ssl', 'nova.openstack.common.sslutils')
 
+session.Session.register_conf_options(CONF, group='glance')
+
 
 def generate_glance_url():
     """Generate the URL to glance."""
@@ -150,7 +152,8 @@ class GlanceImageService(object):
 
     def get_client(self, context, version=1):
         auth_plugin = context.get_auth_plugin()
-        sess = session.Session.load_from_conf_options(CONF.glance,
+        sess = session.Session.load_from_conf_options(CONF,
+                                                      group='glance',
                                                       auth=auth_plugin)
 
         endpoint_override = self.api_servers.next()
@@ -166,7 +169,7 @@ class GlanceImageService(object):
         client = self.get_client(context)
 
         try:
-            images = client.list(**params)
+            images = client.images.list(**params)
         except Exception:
             _reraise_translated_exception()
 
@@ -197,7 +200,7 @@ class GlanceImageService(object):
             version = 2
         client = self.get_client(context, version=version)
         try:
-            image = client.get(image_id)
+            image = client.images.get(image_id)
         except Exception:
             _reraise_translated_image_exception(image_id)
 
@@ -248,8 +251,9 @@ class GlanceImageService(object):
                         LOG.exception(_LE("Download image error"))
 
         client = self.get_client(context)
+        import ipdb; ipdb.set_trace()
         try:
-            image_chunks = client.data(image_id)
+            image_chunks = client.images.data(image_id)
         except Exception:
             _reraise_translated_image_exception(image_id)
 
@@ -270,14 +274,14 @@ class GlanceImageService(object):
 
     def create(self, context, image_meta, data=None):
         """Store the image data and return the new image object."""
-        sent_service_image_meta = _translate_to_glance(image_meta)
+        sent_image_meta = _translate_to_glance(image_meta)
 
         if data:
             sent_service_image_meta['data'] = data
 
         client = self.get(context)
         try:
-            recv_service_image_meta = client.create(**sent_service_image_meta)
+            recv_service_image_meta = client.images.create(**sent_image_meta)
         except glanceclient.exc.HTTPException:
             _reraise_translated_exception()
 
@@ -295,7 +299,7 @@ class GlanceImageService(object):
             image_meta['data'] = data
         client = self.get_client(context)
         try:
-            image_meta = client.update(image_id, **image_meta)
+            image_meta = client.images.update(image_id, **image_meta)
         except Exception:
             _reraise_translated_image_exception(image_id)
         else:
@@ -311,7 +315,7 @@ class GlanceImageService(object):
         """
         client = self.get_client(context)
         try:
-            client.delete(image_id)
+            client.images.delete(image_id)
         except glanceclient.exc.NotFound:
             raise exception.ImageNotFound(image_id=image_id)
         except glanceclient.exc.HTTPForbidden:
