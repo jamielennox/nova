@@ -114,19 +114,11 @@ def get_api_servers():
     """
     api_servers = []
 
-    configured_servers = (['%s:%s' % (CONF.glance.host, CONF.glance.port)]
-                          if CONF.glance.api_servers is None
-                          else CONF.glance.api_servers)
-    for api_server in configured_servers:
-        if '//' not in api_server:
-            api_server = 'http://' + api_server
-        o = urlparse.urlparse(api_server)
-        port = o.port or 80
-        host = o.netloc.rsplit(':', 1)[0]
-        if host[0] == '[' and host[-1] == ']':
-            host = host[1:-1]
-        use_ssl = (o.scheme == 'https')
-        api_servers.append((host, port, use_ssl))
+    if CONF.glance.api_servers:
+        append_http = lambda x: x if '//' in x else 'http://%s' % x
+        api_servers = map(append_http, CONF.glance.api_servers)
+    else:
+        api_servers = ['http://%s:%d' % (CONF.glance.host, CONF.glance.port)]
     random.shuffle(api_servers)
     return itertools.cycle(api_servers)
 
@@ -154,13 +146,18 @@ class GlanceImageService(object):
                               'following error occurred: %(ex)s'),
                           {'module_str': str(mod), 'ex': ex})
 
+        self.api_servers = get_api_servers()
+
     def get_client(self, context, version=1):
         auth_plugin = context.get_auth_plugin()
         sess = session.Session.load_from_conf_options(CONF.glance,
                                                       auth=auth_plugin)
 
+        endpoint_override = self.api_servers.next()
+
         return glanceclient.Client(session=sess,
                                    version=version,
+                                   endpoint_override=endpoint_override,
                                    connect_retries=CONF.glance.num_retries)
 
     def detail(self, context, **kwargs):
