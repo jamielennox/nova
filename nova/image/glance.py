@@ -251,7 +251,6 @@ class GlanceImageService(object):
                         LOG.exception(_LE("Download image error"))
 
         client = self.get_client(context)
-        import ipdb; ipdb.set_trace()
         try:
             image_chunks = client.images.data(image_id)
         except Exception:
